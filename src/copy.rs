@@ -10,15 +10,44 @@ use std::process::Command;
 
 pub fn copy_folder(source: &Path, destination_root: &Path, name: &str) -> io::Result<PathBuf> {
     let destination = destination_root.join(format!("{name}_Backup"));
+    robocopy(source, &destination)?;
+    Ok(destination)
+}
+
+/// Copy the chosen files and folders into `{drive}\{Name}_Backup`.
+/// A folder is copied with everything inside it. A file is copied on its own.
+pub fn copy_items(
+    parent_name: &str,
+    destination_root: &Path,
+    items: &[crate::scan::Child],
+) -> io::Result<PathBuf> {
+    let destination = destination_root.join(format!("{parent_name}_Backup"));
+    std::fs::create_dir_all(&destination)?;
+    for item in items {
+        let target = destination.join(&item.name);
+        match item.kind {
+            crate::scan::ChildKind::Folder => robocopy(&item.path, &target)?,
+            crate::scan::ChildKind::File => {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(&item.path, &target)?;
+            }
+        }
+    }
+    Ok(destination)
+}
+
+fn robocopy(source: &Path, destination: &Path) -> io::Result<()> {
     let output = Command::new("robocopy")
         .arg(source)
-        .arg(&destination)
+        .arg(destination)
         .args(["/E", "/XJ", "/R:2", "/W:2"])
         .output()?;
 
     let code = output.status.code().unwrap_or(16);
     if (0..8).contains(&code) {
-        return Ok(destination);
+        return Ok(());
     }
 
     let detail = command_detail(&output.stderr, &output.stdout);

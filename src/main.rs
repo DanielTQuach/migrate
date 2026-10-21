@@ -9,6 +9,7 @@
 mod copy;
 mod format;
 mod scan;
+mod size;
 
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -43,6 +44,8 @@ struct FolderApp {
     scanning: bool,
     cleared_icon: bool,
     export_dialog: Option<ExportDialog>,
+    anchor: Option<(usize, usize)>,
+    drag_origin: Option<(usize, usize)>,
 }
 
 struct FolderSection {
@@ -51,6 +54,10 @@ struct FolderSection {
     state: SectionState,
     children: Vec<scan::Child>,
     copy_state: CopyState,
+    /// Set once the search index has answered. `None` inside means the index
+    /// had no sizes, so the row adds up the files sitting directly inside.
+    indexed_bytes: Option<u64>,
+    size_ready: bool,
 }
 
 enum CopyState {
@@ -89,6 +96,10 @@ enum ScanEvent {
         index: usize,
         message: String,
     },
+    Sized {
+        index: usize,
+        bytes: Option<u64>,
+    },
 }
 
 impl FolderApp {
@@ -104,6 +115,8 @@ impl FolderApp {
             scanning: false,
             cleared_icon: false,
             export_dialog: None,
+            anchor: None,
+            drag_origin: None,
         };
         app.spawn_scans();
         app
@@ -113,9 +126,12 @@ impl FolderApp {
         let (tx, rx) = mpsc::channel();
         self.events = rx;
         self.scanning = false;
+        let mut sized_paths = Vec::new();
 
         for (index, section) in self.rows.iter_mut().enumerate() {
             section.children.clear();
+            section.indexed_bytes = None;
+            section.size_ready = false;
 
             let Some(path) = section.path.clone() else {
                 section.state = SectionState::Missing;
@@ -124,6 +140,7 @@ impl FolderApp {
 
             section.state = SectionState::Scanning;
             self.scanning = true;
+            sized_paths.push((index, path.clone()));
 
             let tx = tx.clone();
             let ctx = self.ctx.clone();
@@ -139,11 +156,26 @@ impl FolderApp {
                 ctx.request_repaint();
             });
         }
+
+        if !sized_paths.is_empty() {
+            let tx = tx.clone();
+            let ctx = self.ctx.clone();
+            thread::spawn(move || {
+                let paths: Vec<_> = sized_paths.iter().map(|(_, path)| path).collect();
+                let sizes = size::indexed_sizes(&paths);
+                for ((index, _), bytes) in sized_paths.into_iter().zip(sizes) {
+                    let _ = tx.send(ScanEvent::Sized { index, bytes });
+                }
+                ctx.request_repaint();
+            });
+        }
     }
 
     fn drain_events(&mut self) {
         while let Ok(event) = self.events.try_recv() {
-            apply_event(&mut self.rows, event);
+            if let Some(index) = apply_event(&mut self.rows, event) {
+                self.clear_selection_marks(index);
+            }
         }
         while let Ok(event) = self.copy_events.try_recv() {
             apply_copy_event(&mut self.rows, event);
@@ -194,6 +226,88 @@ impl FolderApp {
         }
     }
 
+    fn start_selected_exports(&mut self) {
+        let jobs: Vec<_> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, section)| {
+                if matches!(section.copy_state, CopyState::Copying) {
+                    return None;
+                }
+                let items: Vec<_> = section
+                    .children
+                    .iter()
+                    .filter(|child| child.selected)
+                    .cloned()
+                    .collect();
+                if items.is_empty() {
+                    None
+                } else {
+                    Some((index, section.name, items))
+                }
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+
+        let Some(destination_root) = rfd::FileDialog::new()
+            .set_title("Copy selected items to")
+            .pick_folder()
+        else {
+            return;
+        };
+
+        for (index, name, items) in jobs {
+            self.rows[index].copy_state = CopyState::Copying;
+            let tx = self.copy_tx.clone();
+            let ctx = self.ctx.clone();
+            let destination_root = destination_root.clone();
+            thread::spawn(move || {
+                let event = match copy::copy_items(name, &destination_root, &items) {
+                    Ok(destination) => CopyEvent::Finished { index, destination },
+                    Err(err) => CopyEvent::Failed {
+                        index,
+                        message: err.to_string(),
+                    },
+                };
+                let _ = tx.send(event);
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    fn clear_selection_marks(&mut self, index: usize) {
+        if self.anchor.is_some_and(|(section, _)| section == index) {
+            self.anchor = None;
+        }
+        if self
+            .drag_origin
+            .is_some_and(|(section, _)| section == index)
+        {
+            self.drag_origin = None;
+        }
+    }
+
+    fn any_child_selected(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|section| section.children.iter().any(|child| child.selected))
+    }
+
+    fn known_size(&self) -> Option<u64> {
+        let mut total: u64 = 0;
+        let mut any = false;
+        for section in &self.rows {
+            if let Some(bytes) = section.shown_bytes() {
+                total = total.saturating_add(bytes);
+                any = true;
+            }
+        }
+        any.then_some(total)
+    }
+
     fn child_counts(&self) -> (usize, usize) {
         let mut folders = 0;
         let mut files = 0;
@@ -209,21 +323,48 @@ impl FolderApp {
     }
 }
 
-fn apply_event(rows: &mut [FolderSection], event: ScanEvent) {
+impl FolderSection {
+    /// Indexed total when Windows has one. Otherwise the files directly inside
+    /// this folder, once the index has answered and the names are listed.
+    fn shown_bytes(&self) -> Option<u64> {
+        if !self.size_ready {
+            return None;
+        }
+        if let Some(bytes) = self.indexed_bytes {
+            return Some(bytes);
+        }
+        if matches!(self.state, SectionState::Ready) {
+            return Some(self.children.iter().map(|child| child.bytes).sum());
+        }
+        None
+    }
+}
+
+fn apply_event(rows: &mut [FolderSection], event: ScanEvent) -> Option<usize> {
     match event {
         ScanEvent::Finished { index, children } => {
             let Some(section) = rows.get_mut(index) else {
-                return;
+                return None;
             };
             section.children = children;
             section.state = SectionState::Ready;
+            Some(index)
         }
         ScanEvent::Failed { index, message } => {
             let Some(section) = rows.get_mut(index) else {
-                return;
+                return None;
             };
             section.children.clear();
             section.state = SectionState::Failed(message);
+            Some(index)
+        }
+        ScanEvent::Sized { index, bytes } => {
+            let Some(section) = rows.get_mut(index) else {
+                return None;
+            };
+            section.indexed_bytes = bytes;
+            section.size_ready = true;
+            None
         }
     }
 }
@@ -256,7 +397,7 @@ impl eframe::App for FolderApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let scanning = self.scanning;
         let (folders, files) = self.child_counts();
-        let summary = summary_line(folders, files, scanning);
+        let summary = summary_line(self.known_size(), folders, files, scanning);
         let mut rescan = false;
         let mut open_export = false;
         let copying = self
@@ -285,18 +426,32 @@ impl eframe::App for FolderApp {
             });
         });
 
+        let mut anchor = self.anchor;
+        let mut drag_origin = self.drag_origin;
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for section in &self.rows {
-                        folder_section(ui, section);
+                    for (index, section) in self.rows.iter_mut().enumerate() {
+                        folder_section(ui, index, section, &mut anchor, &mut drag_origin);
                         ui.add_space(8.0);
                     }
                 });
+            let dragging = ui.input(|input| {
+                input.modifiers.shift && input.pointer.button_down(egui::PointerButton::Primary)
+            });
+            if dragging {
+                ui.ctx().request_repaint();
+            } else {
+                drag_origin = None;
+            }
         });
+        self.anchor = anchor;
+        self.drag_origin = drag_origin;
 
-        if open_export {
+        if open_export && self.any_child_selected() {
+            self.start_selected_exports();
+        } else if open_export {
             self.export_dialog = Some(ExportDialog {
                 choosing: false,
                 selected: self
@@ -326,16 +481,21 @@ impl eframe::App for FolderApp {
     }
 }
 
-fn summary_line(folders: usize, files: usize, scanning: bool) -> String {
-    let mut line = format!(
-        "{}  ·  {}",
-        count_label(folders, "folder", "folders"),
-        count_label(files, "file", "files")
-    );
-    if scanning {
-        line.push_str("  ·  scanning");
+fn summary_line(bytes: Option<u64>, folders: usize, files: usize, scanning: bool) -> String {
+    let mut parts = Vec::new();
+    if let Some(bytes) = bytes {
+        parts.push(approximate_size(bytes));
     }
-    line
+    parts.push(count_label(folders, "folder", "folders"));
+    parts.push(count_label(files, "file", "files"));
+    if scanning {
+        parts.push("scanning".to_string());
+    }
+    parts.join("  ·  ")
+}
+
+fn approximate_size(bytes: u64) -> String {
+    format!("~{}", format::format_bytes(bytes))
 }
 
 fn count_label(count: usize, one: &str, many: &str) -> String {
@@ -343,7 +503,13 @@ fn count_label(count: usize, one: &str, many: &str) -> String {
     format!("{} {word}", format::format_count(count as u64))
 }
 
-fn folder_section(ui: &mut egui::Ui, section: &FolderSection) {
+fn folder_section(
+    ui: &mut egui::Ui,
+    section_index: usize,
+    section: &mut FolderSection,
+    anchor: &mut Option<(usize, usize)>,
+    drag_origin: &mut Option<(usize, usize)>,
+) {
     let frame = egui::Frame::NONE
         .fill(ui.visuals().faint_bg_color)
         .inner_margin(12.0)
@@ -358,16 +524,21 @@ fn folder_section(ui: &mut egui::Ui, section: &FolderSection) {
                 id,
                 false,
             );
+            let status = section_status(section);
+            let name = section.name;
             let header = ui.vertical(|ui| {
                 ui.set_min_width(ui.available_width());
                 let mut name_clicked = false;
                 ui.horizontal(|ui| {
                     state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
-                    let name = egui::RichText::new(section.name).strong().size(17.0);
-                    if ui.add(egui::Button::new(name).frame(false)).clicked() {
+                    select_all_checkbox(ui, &mut section.children);
+                    let title = egui::RichText::new(name).strong().size(17.0);
+                    if ui.add(egui::Button::new(title).frame(false)).clicked() {
                         name_clicked = true;
                     }
-                    section_status_label(ui, section);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(&status).monospace());
+                    });
                 });
                 section_path(ui, section);
                 name_clicked
@@ -377,9 +548,39 @@ fn folder_section(ui: &mut egui::Ui, section: &FolderSection) {
             }
             state.show_body_indented(&header.response, ui, |ui| {
                 ui.add_space(6.0);
-                for child in &section.children {
-                    child_row(ui, child);
+                let shift = ui.input(|input| input.modifiers.shift);
+                let mut hits = Vec::new();
+                for (child_index, child) in section.children.iter_mut().enumerate() {
+                    hits.push((child_index, child_row(ui, child)));
                 }
+                let rects: Vec<_> = hits.iter().map(|(_, hit)| hit.rect).collect();
+                for (child_index, hit) in hits {
+                    if hit.checkbox_clicked {
+                        *anchor = Some((section_index, child_index));
+                    } else if hit.clicked {
+                        if shift {
+                            let from = anchor
+                                .filter(|(section, _)| *section == section_index)
+                                .map(|(_, index)| index)
+                                .unwrap_or(child_index);
+                            select_range(&mut section.children, from, child_index);
+                        } else {
+                            select_only(&mut section.children, child_index);
+                            *anchor = Some((section_index, child_index));
+                        }
+                    }
+                    if hit.drag_started && shift {
+                        *drag_origin = Some((section_index, child_index));
+                        *anchor = Some((section_index, child_index));
+                    }
+                }
+                apply_drag(
+                    ui,
+                    section_index,
+                    &mut section.children,
+                    drag_origin,
+                    &rects,
+                );
             });
         } else {
             section_heading(ui, section);
@@ -499,7 +700,10 @@ fn section_status(section: &FolderSection) -> String {
         SectionState::Missing => "Not available".to_string(),
         SectionState::Failed(_) => "Could not read".to_string(),
         SectionState::Waiting | SectionState::Scanning => "Reading…".to_string(),
-        SectionState::Ready if section.children.is_empty() => "Empty".to_string(),
+        SectionState::Ready if section.children.is_empty() => match section.shown_bytes() {
+            Some(bytes) => format!("{}  ·  Empty", approximate_size(bytes)),
+            None => "Empty".to_string(),
+        },
         SectionState::Ready => {
             let folders = section
                 .children
@@ -507,11 +711,15 @@ fn section_status(section: &FolderSection) -> String {
                 .filter(|child| child.kind == scan::ChildKind::Folder)
                 .count();
             let files = section.children.len() - folders;
-            format!(
+            let counts = format!(
                 "{}  ·  {}",
                 count_label(folders, "folder", "folders"),
                 count_label(files, "file", "files")
-            )
+            );
+            match section.shown_bytes() {
+                Some(bytes) => format!("{}  ·  {counts}", approximate_size(bytes)),
+                None => counts,
+            }
         }
     }
 }
@@ -535,18 +743,130 @@ fn section_detail_color(ui: &egui::Ui, section: &FolderSection) -> egui::Color32
     }
 }
 
-fn child_row(ui: &mut egui::Ui, child: &scan::Child) {
+struct RowHit {
+    clicked: bool,
+    drag_started: bool,
+    checkbox_clicked: bool,
+    rect: egui::Rect,
+}
+
+fn child_row(ui: &mut egui::Ui, child: &mut scan::Child) -> RowHit {
+    let mut checkbox_clicked = false;
+    let mut clicked = false;
+    let mut drag_started = false;
+    let mut rect = egui::Rect::NOTHING;
     ui.horizontal(|ui| {
-        ui.label(&child.name)
+        if ui
+            .add(egui::Checkbox::new(&mut child.selected, ""))
+            .clicked()
+        {
+            checkbox_clicked = true;
+        }
+        let response = ui
+            .allocate_response(
+                egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                egui::Sense::click_and_drag(),
+            )
             .on_hover_text(child.path.display().to_string());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let label = match child.kind {
-                scan::ChildKind::Folder => "Folder".to_string(),
-                scan::ChildKind::File => format::format_bytes(child.bytes),
-            };
-            ui.label(egui::RichText::new(label).monospace().weak());
-        });
+        rect = response.rect;
+        if child.selected {
+            ui.painter()
+                .rect_filled(response.rect, 3.0, ui.visuals().selection.bg_fill);
+        }
+        let name_color = ui.visuals().text_color();
+        let size_color = ui.visuals().weak_text_color();
+        let name_font = egui::TextStyle::Body.resolve(ui.style());
+        let size_font = egui::TextStyle::Monospace.resolve(ui.style());
+        let size_label = match child.kind {
+            scan::ChildKind::Folder => "Folder".to_string(),
+            scan::ChildKind::File => format::format_bytes(child.bytes),
+        };
+        let size_galley = ui
+            .painter()
+            .layout_no_wrap(size_label, size_font, size_color);
+        let name_rect = egui::Rect::from_min_max(
+            response.rect.left_top(),
+            egui::pos2(
+                response.rect.right() - size_galley.size().x - 12.0,
+                response.rect.bottom(),
+            ),
+        );
+        ui.painter().with_clip_rect(name_rect).text(
+            response.rect.left_center() + egui::vec2(4.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            &child.name,
+            name_font,
+            name_color,
+        );
+        ui.painter().galley(
+            egui::pos2(
+                response.rect.right() - size_galley.size().x - 4.0,
+                response.rect.center().y - size_galley.size().y * 0.5,
+            ),
+            size_galley,
+            size_color,
+        );
+        clicked = response.clicked();
+        drag_started = response.drag_started();
     });
+    RowHit {
+        clicked,
+        drag_started,
+        checkbox_clicked,
+        rect,
+    }
+}
+
+fn select_all_checkbox(ui: &mut egui::Ui, children: &mut [scan::Child]) {
+    if children.is_empty() {
+        return;
+    }
+    let mut all = children.iter().all(|child| child.selected);
+    let mixed = children.iter().any(|child| child.selected) && !all;
+    if ui
+        .add(egui::Checkbox::new(&mut all, "").indeterminate(mixed))
+        .changed()
+    {
+        for child in children {
+            child.selected = all;
+        }
+    }
+}
+
+fn select_only(children: &mut [scan::Child], chosen: usize) {
+    for (index, child) in children.iter_mut().enumerate() {
+        child.selected = index == chosen;
+    }
+}
+
+fn select_range(children: &mut [scan::Child], from: usize, to: usize) {
+    let start = from.min(to);
+    let end = from.max(to);
+    for (index, child) in children.iter_mut().enumerate() {
+        child.selected = (start..=end).contains(&index);
+    }
+}
+
+fn apply_drag(
+    ui: &mut egui::Ui,
+    section_index: usize,
+    children: &mut [scan::Child],
+    drag_origin: &Option<(usize, usize)>,
+    rects: &[egui::Rect],
+) {
+    let Some((origin_section, origin_index)) = *drag_origin else {
+        return;
+    };
+    if origin_section != section_index {
+        return;
+    }
+    let Some(pos) = ui.input(|input| input.pointer.interact_pos()) else {
+        return;
+    };
+    let Some(hover) = rects.iter().position(|rect| rect.contains(pos)) else {
+        return;
+    };
+    select_range(children, origin_index, hover);
 }
 
 fn default_sections() -> Vec<FolderSection> {
@@ -565,6 +885,8 @@ fn default_sections() -> Vec<FolderSection> {
         state: SectionState::Waiting,
         children: Vec::new(),
         copy_state: CopyState::Idle,
+        indexed_bytes: None,
+        size_ready: false,
     })
     .collect()
 }

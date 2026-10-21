@@ -12,12 +12,13 @@ pub enum ChildKind {
     File,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Child {
     pub name: String,
     pub path: PathBuf,
     pub kind: ChildKind,
     pub bytes: u64,
+    pub selected: bool,
 }
 
 /// One pass over `path`. Subfolders are names only; their contents are not read.
@@ -36,6 +37,7 @@ pub fn list_folder(path: &Path) -> io::Result<Vec<Child>> {
                 path: child_path,
                 kind: ChildKind::File,
                 bytes: 0,
+                selected: false,
             });
             continue;
         };
@@ -46,6 +48,7 @@ pub fn list_folder(path: &Path) -> io::Result<Vec<Child>> {
                 path: child_path,
                 kind: ChildKind::Folder,
                 bytes: 0,
+                selected: false,
             });
         } else {
             children.push(Child {
@@ -53,6 +56,7 @@ pub fn list_folder(path: &Path) -> io::Result<Vec<Child>> {
                 path: child_path,
                 kind: ChildKind::File,
                 bytes: meta.len(),
+                selected: false,
             });
         }
     }
