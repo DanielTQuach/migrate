@@ -4,7 +4,7 @@
 //!
 //! Each folder is walked on its own thread. Those threads send running totals
 //! through a channel. [`FolderApp::logic`] reads the channel, and [`FolderApp::ui`]
-//! draws one bar per folder.
+//! draws one row per folder.
 
 mod format;
 mod scan;
@@ -19,8 +19,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Folders")
-            .with_inner_size([720.0, 220.0])
-            .with_min_inner_size([560.0, 180.0])
+            .with_inner_size([720.0, 640.0])
+            .with_min_inner_size([560.0, 320.0])
             .with_icon(egui::IconData::default()),
         persist_window: false,
         ..Default::default()
@@ -222,9 +222,14 @@ impl eframe::App for FolderApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            for row in &self.rows {
-                folder_row(ui, row);
-            }
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for row in &self.rows {
+                        folder_row(ui, row);
+                        ui.add_space(8.0);
+                    }
+                });
         });
 
         if rescan {
@@ -301,13 +306,23 @@ fn stats_line(row: &FolderRow) -> String {
 }
 
 fn default_rows() -> Vec<FolderRow> {
-    vec![FolderRow {
-        name: "Downloads",
-        path: dirs::download_dir(),
+    [
+        ("Downloads", dirs::download_dir()),
+        ("Documents", dirs::document_dir()),
+        ("Videos", dirs::video_dir()),
+        ("Music", dirs::audio_dir()),
+        ("Pictures", dirs::picture_dir()),
+        ("Desktop", dirs::desktop_dir()),
+    ]
+    .into_iter()
+    .map(|(name, path)| FolderRow {
+        name,
+        path,
         files: 0,
         bytes: 0,
         state: RowState::Waiting,
-    }]
+    })
+    .collect()
 }
 
 fn disconnected_channel() -> mpsc::Receiver<ScanEvent> {
