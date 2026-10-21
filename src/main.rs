@@ -63,14 +63,68 @@ struct FolderSection {
 
 enum CopyState {
     Idle,
-    Copying,
+    Copying { copied: u64, total: u64 },
     Copied(PathBuf),
     Failed(String),
 }
 
 enum CopyEvent {
-    Finished { index: usize, destination: PathBuf },
-    Failed { index: usize, message: String },
+    Progress {
+        index: usize,
+        copied: u64,
+        total: u64,
+    },
+    Finished {
+        index: usize,
+        destination: PathBuf,
+    },
+    Failed {
+        index: usize,
+        message: String,
+    },
+}
+
+struct ProgressReporter {
+    tx: mpsc::Sender<CopyEvent>,
+    ctx: egui::Context,
+    index: usize,
+    last_send: std::time::Instant,
+    last_copied: u64,
+}
+
+impl ProgressReporter {
+    fn new(tx: mpsc::Sender<CopyEvent>, ctx: egui::Context, index: usize) -> Self {
+        Self {
+            tx,
+            ctx,
+            index,
+            last_send: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            last_copied: u64::MAX,
+        }
+    }
+
+    fn report(&mut self, copied: u64, total: u64) {
+        let copied = if total == 0 { 0 } else { copied.min(total) };
+        let done = total > 0 && copied >= total;
+        let now = std::time::Instant::now();
+        if !done
+            && copied == self.last_copied
+            && now.duration_since(self.last_send) < std::time::Duration::from_millis(80)
+        {
+            return;
+        }
+        if !done && now.duration_since(self.last_send) < std::time::Duration::from_millis(80) {
+            return;
+        }
+        self.last_send = now;
+        self.last_copied = copied;
+        let _ = self.tx.send(CopyEvent::Progress {
+            index: self.index,
+            copied,
+            total,
+        });
+        self.ctx.request_repaint();
+    }
 }
 
 struct ExportDialog {
@@ -193,7 +247,7 @@ impl FolderApp {
             .into_iter()
             .filter(|index| {
                 self.rows[*index].path.is_some()
-                    && !matches!(self.rows[*index].copy_state, CopyState::Copying)
+                    && !matches!(self.rows[*index].copy_state, CopyState::Copying { .. })
             })
             .collect();
         if pending.is_empty() {
@@ -210,12 +264,23 @@ impl FolderApp {
         for index in pending {
             let source = self.rows[index].path.clone().unwrap();
             let name = self.rows[index].name;
-            self.rows[index].copy_state = CopyState::Copying;
+            self.rows[index].copy_state = CopyState::Copying {
+                copied: 0,
+                total: 0,
+            };
             let tx = self.copy_tx.clone();
             let ctx = self.ctx.clone();
             let destination_root = destination_root.clone();
             thread::spawn(move || {
-                let event = match copy::copy_folder(&source, &destination_root, name) {
+                let mut reporter = ProgressReporter::new(tx.clone(), ctx.clone(), index);
+                let event = match copy::copy_folder(
+                    &source,
+                    &destination_root,
+                    name,
+                    &mut |copied, total| {
+                        reporter.report(copied, total);
+                    },
+                ) {
                     Ok(destination) => CopyEvent::Finished { index, destination },
                     Err(err) => CopyEvent::Failed {
                         index,
@@ -234,7 +299,7 @@ impl FolderApp {
             .iter()
             .enumerate()
             .filter_map(|(index, section)| {
-                if matches!(section.copy_state, CopyState::Copying) {
+                if matches!(section.copy_state, CopyState::Copying { .. }) {
                     return None;
                 }
                 let items: Vec<_> = section
@@ -262,18 +327,25 @@ impl FolderApp {
         };
 
         for (index, name, items) in jobs {
-            self.rows[index].copy_state = CopyState::Copying;
+            self.rows[index].copy_state = CopyState::Copying {
+                copied: 0,
+                total: 0,
+            };
             let tx = self.copy_tx.clone();
             let ctx = self.ctx.clone();
             let destination_root = destination_root.clone();
             thread::spawn(move || {
-                let event = match copy::copy_items(name, &destination_root, &items) {
-                    Ok(destination) => CopyEvent::Finished { index, destination },
-                    Err(err) => CopyEvent::Failed {
-                        index,
-                        message: err.to_string(),
-                    },
-                };
+                let mut reporter = ProgressReporter::new(tx.clone(), ctx.clone(), index);
+                let event =
+                    match copy::copy_items(name, &destination_root, &items, &mut |copied, total| {
+                        reporter.report(copied, total);
+                    }) {
+                        Ok(destination) => CopyEvent::Finished { index, destination },
+                        Err(err) => CopyEvent::Failed {
+                            index,
+                            message: err.to_string(),
+                        },
+                    };
                 let _ = tx.send(event);
                 ctx.request_repaint();
             });
@@ -290,6 +362,24 @@ impl FolderApp {
         {
             self.drag_origin = None;
         }
+    }
+
+    fn copy_progress(&self) -> Option<(u64, u64)> {
+        let mut copied: u64 = 0;
+        let mut total: u64 = 0;
+        let mut any = false;
+        for section in &self.rows {
+            if let CopyState::Copying {
+                copied: done,
+                total: job,
+            } = section.copy_state
+            {
+                any = true;
+                copied = copied.saturating_add(done);
+                total = total.saturating_add(job);
+            }
+        }
+        any.then_some((copied, total))
     }
 
     fn any_child_selected(&self) -> bool {
@@ -373,6 +463,18 @@ fn apply_event(rows: &mut [FolderSection], event: ScanEvent) -> Option<usize> {
 
 fn apply_copy_event(rows: &mut [FolderSection], event: CopyEvent) {
     match event {
+        CopyEvent::Progress {
+            index,
+            copied,
+            total,
+        } => {
+            let Some(section) = rows.get_mut(index) else {
+                return;
+            };
+            if matches!(section.copy_state, CopyState::Copying { .. }) {
+                section.copy_state = CopyState::Copying { copied, total };
+            }
+        }
         CopyEvent::Finished { index, destination } => {
             let Some(section) = rows.get_mut(index) else {
                 return;
@@ -402,10 +504,8 @@ impl eframe::App for FolderApp {
         let summary = summary_line(self.known_size(), folders, files, scanning);
         let mut rescan = false;
         let mut open_export = false;
-        let copying = self
-            .rows
-            .iter()
-            .any(|section| matches!(section.copy_state, CopyState::Copying));
+        let copy_progress = self.copy_progress();
+        let copying = copy_progress.is_some();
         let can_export = !copying && self.rows.iter().any(|section| section.path.is_some());
 
         egui::Panel::top("header").show(ui, |ui| {
@@ -426,6 +526,10 @@ impl eframe::App for FolderApp {
                     }
                 });
             });
+            if let Some((copied, total)) = copy_progress {
+                ui.add_space(8.0);
+                ui.add(copy_progress_bar(copied, total));
+            }
         });
 
         let mut anchor = self.anchor;
@@ -597,6 +701,26 @@ fn summary_line(bytes: Option<u64>, folders: usize, files: usize, scanning: bool
         parts.push("scanning".to_string());
     }
     parts.join("  ·  ")
+}
+
+fn copy_progress_bar(copied: u64, total: u64) -> egui::ProgressBar {
+    let fraction = if total == 0 {
+        0.0
+    } else {
+        (copied as f32 / total as f32).clamp(0.0, 1.0)
+    };
+    let label = if total == 0 {
+        "Copying…".to_string()
+    } else {
+        let left = total.saturating_sub(copied);
+        format!(
+            "{} of {}   ·   {} left",
+            format::format_bytes(copied),
+            format::format_bytes(total),
+            format::format_bytes(left)
+        )
+    };
+    egui::ProgressBar::new(fraction).text(label)
 }
 
 fn approximate_size(bytes: u64) -> String {
@@ -780,8 +904,17 @@ fn section_path(ui: &mut egui::Ui, section: &FolderSection) {
     ui.label(egui::RichText::new(detail).small().color(detail_color));
     match &section.copy_state {
         CopyState::Idle => {}
-        CopyState::Copying => {
-            ui.label(egui::RichText::new("Copying…").small().weak());
+        CopyState::Copying { copied, total } => {
+            let label = if *total == 0 {
+                "Copying…".to_string()
+            } else {
+                format!(
+                    "Copying  {} of {}",
+                    format::format_bytes(*copied),
+                    format::format_bytes(*total)
+                )
+            };
+            ui.label(egui::RichText::new(label).small().weak());
         }
         CopyState::Copied(path) => {
             ui.label(
