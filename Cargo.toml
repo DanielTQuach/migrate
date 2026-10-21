@@ -1,0 +1,11 @@
+[package]
+name = "migrate"
+version = "0.1.0"
+edition = "2021"
+description = "See how much space the usual desktop folders are using"
+
+[dependencies]
+dirs = "7"
+eframe = "0.37"
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
