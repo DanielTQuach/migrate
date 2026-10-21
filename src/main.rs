@@ -1,10 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! Window that shows how big the usual desktop folders are.
+//! Window that lists what is directly inside the usual desktop folders.
 //!
-//! Each folder is walked on its own thread. Those threads send running totals
+//! Each folder is read once, on its own thread. Those threads send the names
 //! through a channel. [`FolderApp::logic`] reads the channel, and [`FolderApp::ui`]
-//! draws one row per folder.
+//! draws one section per folder.
 
 mod format;
 mod scan;
@@ -35,22 +35,21 @@ fn main() -> eframe::Result {
 
 struct FolderApp {
     ctx: egui::Context,
-    rows: Vec<FolderRow>,
+    rows: Vec<FolderSection>,
     events: mpsc::Receiver<ScanEvent>,
     scanning: bool,
     cleared_icon: bool,
 }
 
-struct FolderRow {
+struct FolderSection {
     name: &'static str,
     path: Option<PathBuf>,
-    files: u64,
-    bytes: u64,
-    state: RowState,
+    state: SectionState,
+    children: Vec<scan::Child>,
 }
 
 #[derive(Debug)]
-enum RowState {
+enum SectionState {
     Waiting,
     Scanning,
     Ready,
@@ -59,15 +58,9 @@ enum RowState {
 }
 
 enum ScanEvent {
-    Progress {
-        index: usize,
-        files: u64,
-        bytes: u64,
-    },
     Finished {
         index: usize,
-        files: u64,
-        bytes: u64,
+        children: Vec<scan::Child>,
     },
     Failed {
         index: usize,
@@ -80,7 +73,7 @@ impl FolderApp {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let mut app = Self {
             ctx: cc.egui_ctx.clone(),
-            rows: default_rows(),
+            rows: default_sections(),
             events: disconnected_channel(),
             scanning: false,
             cleared_icon: false,
@@ -94,35 +87,22 @@ impl FolderApp {
         self.events = rx;
         self.scanning = false;
 
-        for (index, row) in self.rows.iter_mut().enumerate() {
-            row.files = 0;
-            row.bytes = 0;
+        for (index, section) in self.rows.iter_mut().enumerate() {
+            section.children.clear();
 
-            let Some(path) = row.path.clone() else {
-                row.state = RowState::Missing;
+            let Some(path) = section.path.clone() else {
+                section.state = SectionState::Missing;
                 continue;
             };
 
-            row.state = RowState::Scanning;
+            section.state = SectionState::Scanning;
             self.scanning = true;
 
             let tx = tx.clone();
             let ctx = self.ctx.clone();
             thread::spawn(move || {
-                let result = scan::scan_folder(&path, |files, bytes| {
-                    let _ = tx.send(ScanEvent::Progress {
-                        index,
-                        files,
-                        bytes,
-                    });
-                    ctx.request_repaint();
-                });
-                let event = match result {
-                    Ok(totals) => ScanEvent::Finished {
-                        index,
-                        files: totals.files,
-                        bytes: totals.bytes,
-                    },
+                let event = match scan::list_folder(&path) {
+                    Ok(children) => ScanEvent::Finished { index, children },
                     Err(err) => ScanEvent::Failed {
                         index,
                         message: err.to_string(),
@@ -141,50 +121,39 @@ impl FolderApp {
         self.scanning = self
             .rows
             .iter()
-            .any(|row| matches!(row.state, RowState::Scanning));
+            .any(|section| matches!(section.state, SectionState::Scanning));
     }
 
-    fn total_bytes(&self) -> u64 {
-        self.rows.iter().map(|row| row.bytes).sum()
-    }
-
-    fn total_files(&self) -> u64 {
-        self.rows.iter().map(|row| row.files).sum()
+    fn child_counts(&self) -> (usize, usize) {
+        let mut folders = 0;
+        let mut files = 0;
+        for section in &self.rows {
+            for child in &section.children {
+                match child.kind {
+                    scan::ChildKind::Folder => folders += 1,
+                    scan::ChildKind::File => files += 1,
+                }
+            }
+        }
+        (folders, files)
     }
 }
 
-fn apply_event(rows: &mut [FolderRow], event: ScanEvent) {
+fn apply_event(rows: &mut [FolderSection], event: ScanEvent) {
     match event {
-        ScanEvent::Progress {
-            index,
-            files,
-            bytes,
-        } => {
-            let Some(row) = rows.get_mut(index) else {
+        ScanEvent::Finished { index, children } => {
+            let Some(section) = rows.get_mut(index) else {
                 return;
             };
-            if matches!(row.state, RowState::Scanning) {
-                row.files = files;
-                row.bytes = bytes;
-            }
-        }
-        ScanEvent::Finished {
-            index,
-            files,
-            bytes,
-        } => {
-            let Some(row) = rows.get_mut(index) else {
-                return;
-            };
-            row.files = files;
-            row.bytes = bytes;
-            row.state = RowState::Ready;
+            section.children = children;
+            section.state = SectionState::Ready;
         }
         ScanEvent::Failed { index, message } => {
-            let Some(row) = rows.get_mut(index) else {
+            let Some(section) = rows.get_mut(index) else {
                 return;
             };
-            row.state = RowState::Failed(message);
+            section.children.clear();
+            section.state = SectionState::Failed(message);
         }
     }
 }
@@ -199,12 +168,8 @@ impl eframe::App for FolderApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let scanning = self.scanning;
-        let summary = summary_line(
-            self.rows.len(),
-            self.total_files(),
-            self.total_bytes(),
-            scanning,
-        );
+        let (folders, files) = self.child_counts();
+        let summary = summary_line(folders, files, scanning);
         let mut rescan = false;
 
         egui::Panel::top("header").show(ui, |ui| {
@@ -225,8 +190,8 @@ impl eframe::App for FolderApp {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for row in &self.rows {
-                        folder_row(ui, row);
+                    for section in &self.rows {
+                        folder_section(ui, section);
                         ui.add_space(8.0);
                     }
                 });
@@ -238,12 +203,11 @@ impl eframe::App for FolderApp {
     }
 }
 
-fn summary_line(folders: usize, files: u64, bytes: u64, scanning: bool) -> String {
-    let folder_word = if folders == 1 { "folder" } else { "folders" };
+fn summary_line(folders: usize, files: usize, scanning: bool) -> String {
     let mut line = format!(
-        "{folders} {folder_word}  ·  {}  ·  {} files",
-        format::format_bytes(bytes),
-        format::format_count(files)
+        "{}  ·  {}",
+        count_label(folders, "folder", "folders"),
+        count_label(files, "file", "files")
     );
     if scanning {
         line.push_str("  ·  scanning");
@@ -251,61 +215,130 @@ fn summary_line(folders: usize, files: u64, bytes: u64, scanning: bool) -> Strin
     line
 }
 
-fn folder_row(ui: &mut egui::Ui, row: &FolderRow) {
+fn count_label(count: usize, one: &str, many: &str) -> String {
+    let word = if count == 1 { one } else { many };
+    format!("{} {word}", format::format_count(count as u64))
+}
+
+fn folder_section(ui: &mut egui::Ui, section: &FolderSection) {
     let frame = egui::Frame::NONE
         .fill(ui.visuals().faint_bg_color)
         .inner_margin(12.0)
         .corner_radius(8.0);
     frame.show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(row.name).strong().size(17.0));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(stats_line(row)).monospace()).truncate(),
-                );
+        let can_expand =
+            matches!(section.state, SectionState::Ready) && !section.children.is_empty();
+        if can_expand {
+            let id = ui.make_persistent_id(section.name);
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                id,
+                false,
+            );
+            let header = ui.vertical(|ui| {
+                ui.set_min_width(ui.available_width());
+                let mut name_clicked = false;
+                ui.horizontal(|ui| {
+                    state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+                    let name = egui::RichText::new(section.name).strong().size(17.0);
+                    if ui.add(egui::Button::new(name).frame(false)).clicked() {
+                        name_clicked = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(section_status(section)).monospace());
+                    });
+                });
+                section_path(ui, section);
+                name_clicked
             });
-        });
-        ui.add_space(6.0);
-
-        let (detail, detail_color) = match &row.state {
-            RowState::Missing => (
-                "This folder is not on this PC".to_string(),
-                ui.visuals().weak_text_color(),
-            ),
-            RowState::Failed(message) => (message.clone(), egui::Color32::from_rgb(255, 150, 140)),
-            _ => (
-                row.path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default(),
-                ui.visuals().weak_text_color(),
-            ),
-        };
-        ui.add(
-            egui::Label::new(egui::RichText::new(detail).small().color(detail_color)).truncate(),
-        );
+            if header.inner {
+                state.toggle(ui);
+            }
+            state.show_body_indented(&header.response, ui, |ui| {
+                ui.add_space(6.0);
+                for child in &section.children {
+                    child_row(ui, child);
+                }
+            });
+        } else {
+            section_heading(ui, section);
+            section_path(ui, section);
+        }
     });
 }
 
-fn stats_line(row: &FolderRow) -> String {
-    match &row.state {
-        RowState::Missing => "Not available".to_string(),
-        RowState::Failed(_) => "Could not read".to_string(),
-        RowState::Scanning if row.files == 0 && row.bytes == 0 => "Scanning…".to_string(),
-        RowState::Scanning => format!(
-            "{}   ·   {} files   ·   scanning",
-            format::format_bytes(row.bytes),
-            format::format_count(row.files)
-        ),
-        RowState::Waiting | RowState::Ready => format!(
-            "{}   ·   {} files",
-            format::format_bytes(row.bytes),
-            format::format_count(row.files)
-        ),
+fn section_heading(ui: &mut egui::Ui, section: &FolderSection) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(section.name).strong().size(17.0));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(section_status(section)).monospace());
+        });
+    });
+}
+
+fn section_path(ui: &mut egui::Ui, section: &FolderSection) {
+    ui.add_space(4.0);
+    let detail = section_detail(section);
+    let detail_color = section_detail_color(ui, section);
+    ui.label(egui::RichText::new(detail).small().color(detail_color));
+}
+
+fn section_status(section: &FolderSection) -> String {
+    match &section.state {
+        SectionState::Missing => "Not available".to_string(),
+        SectionState::Failed(_) => "Could not read".to_string(),
+        SectionState::Waiting | SectionState::Scanning => "Reading…".to_string(),
+        SectionState::Ready if section.children.is_empty() => "Empty".to_string(),
+        SectionState::Ready => {
+            let folders = section
+                .children
+                .iter()
+                .filter(|child| child.kind == scan::ChildKind::Folder)
+                .count();
+            let files = section.children.len() - folders;
+            format!(
+                "{}  ·  {}",
+                count_label(folders, "folder", "folders"),
+                count_label(files, "file", "files")
+            )
+        }
     }
 }
 
-fn default_rows() -> Vec<FolderRow> {
+fn section_detail(section: &FolderSection) -> String {
+    match &section.state {
+        SectionState::Missing => "This folder is not on this PC".to_string(),
+        SectionState::Failed(message) => message.clone(),
+        _ => section
+            .path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    }
+}
+
+fn section_detail_color(ui: &egui::Ui, section: &FolderSection) -> egui::Color32 {
+    match &section.state {
+        SectionState::Failed(_) => egui::Color32::from_rgb(255, 150, 140),
+        _ => ui.visuals().weak_text_color(),
+    }
+}
+
+fn child_row(ui: &mut egui::Ui, child: &scan::Child) {
+    ui.horizontal(|ui| {
+        ui.label(&child.name)
+            .on_hover_text(child.path.display().to_string());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let label = match child.kind {
+                scan::ChildKind::Folder => "Folder".to_string(),
+                scan::ChildKind::File => format::format_bytes(child.bytes),
+            };
+            ui.label(egui::RichText::new(label).monospace().weak());
+        });
+    });
+}
+
+fn default_sections() -> Vec<FolderSection> {
     [
         ("Downloads", dirs::download_dir()),
         ("Documents", dirs::document_dir()),
@@ -315,12 +348,11 @@ fn default_rows() -> Vec<FolderRow> {
         ("Desktop", dirs::desktop_dir()),
     ]
     .into_iter()
-    .map(|(name, path)| FolderRow {
+    .map(|(name, path)| FolderSection {
         name,
         path,
-        files: 0,
-        bytes: 0,
-        state: RowState::Waiting,
+        state: SectionState::Waiting,
+        children: Vec::new(),
     })
     .collect()
 }

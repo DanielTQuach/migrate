@@ -1,77 +1,75 @@
-//! Walk a folder and total how many files it holds and how large they are.
+//! Read one folder and list the files and folders sitting directly inside it.
 //!
-//! Directory junctions and symlinks are not followed, so a cyclic link cannot
-//! make the walk run forever.
+//! Nothing nested is opened. A folder's own contents stay unread.
 
 use std::fs;
 use std::io;
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildKind {
+    Folder,
+    File,
+}
 
 #[derive(Debug)]
-pub struct ScanTotals {
-    pub files: u64,
+pub struct Child {
+    pub name: String,
+    pub path: PathBuf,
+    pub kind: ChildKind,
     pub bytes: u64,
 }
 
-/// `on_progress` is called every so often with the running totals.
-/// The final totals are the returned value, not the last progress call.
-pub fn scan_folder(path: &Path, mut on_progress: impl FnMut(u64, u64)) -> io::Result<ScanTotals> {
-    let mut files = 0u64;
-    let mut bytes = 0u64;
-    let mut stack = vec![path.to_path_buf()];
-    let mut root_pending = true;
-    let mut last_report = Instant::now();
+/// One pass over `path`. Subfolders are names only; their contents are not read.
+pub fn list_folder(path: &Path) -> io::Result<Vec<Child>> {
+    let mut children = Vec::new();
 
-    while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(err) if root_pending => return Err(err),
-            Err(_) => continue,
+    for entry in fs::read_dir(path)? {
+        let Ok(entry) = entry else {
+            continue;
         };
-        root_pending = false;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let child_path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            children.push(Child {
+                name,
+                path: child_path,
+                kind: ChildKind::File,
+                bytes: 0,
+            });
+            continue;
+        };
 
-        for entry in entries {
-            let Ok(entry) = entry else {
-                continue;
-            };
-            // Does not follow links, so a junction still looks like a junction.
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-
-            if meta.is_dir() {
-                if is_reparse_point(&meta) {
-                    continue;
-                }
-                stack.push(entry.path());
-                continue;
-            }
-
-            if meta.is_file() {
-                files += 1;
-                bytes = bytes.saturating_add(meta.len());
-                if last_report.elapsed() >= Duration::from_millis(80) {
-                    on_progress(files, bytes);
-                    last_report = Instant::now();
-                }
-            }
+        if meta.is_dir() {
+            children.push(Child {
+                name,
+                path: child_path,
+                kind: ChildKind::Folder,
+                bytes: 0,
+            });
+        } else {
+            children.push(Child {
+                name,
+                path: child_path,
+                kind: ChildKind::File,
+                bytes: meta.len(),
+            });
         }
     }
 
-    Ok(ScanTotals { files, bytes })
+    children.sort_by(|left, right| {
+        kind_rank(left.kind)
+            .cmp(&kind_rank(right.kind))
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    Ok(children)
 }
 
-#[cfg(windows)]
-fn is_reparse_point(meta: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_reparse_point(meta: &fs::Metadata) -> bool {
-    meta.file_type().is_symlink()
+fn kind_rank(kind: ChildKind) -> u8 {
+    match kind {
+        ChildKind::Folder => 0,
+        ChildKind::File => 1,
+    }
 }
 
 #[cfg(test)]
@@ -79,7 +77,7 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_workspace() -> std::path::PathBuf {
+    fn temp_workspace() -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -91,14 +89,18 @@ mod tests {
     }
 
     #[test]
-    fn sums_files_in_nested_folders() {
+    fn lists_only_the_top_level() {
         let root = temp_workspace();
         fs::write(root.join("a.txt"), b"hello").unwrap();
         fs::write(root.join("nested").join("b.txt"), b"world!").unwrap();
 
-        let totals = scan_folder(&root, |_, _| {}).unwrap();
-        assert_eq!(totals.files, 2);
-        assert_eq!(totals.bytes, 11);
+        let children = list_folder(&root).unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].name, "nested");
+        assert_eq!(children[0].kind, ChildKind::Folder);
+        assert_eq!(children[1].name, "a.txt");
+        assert_eq!(children[1].kind, ChildKind::File);
+        assert_eq!(children[1].bytes, 5);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -107,7 +109,7 @@ mod tests {
     fn reports_a_missing_root() {
         let missing = std::env::temp_dir().join("migrate-scan-missing-folder");
         let _ = fs::remove_dir_all(&missing);
-        let error = scan_folder(&missing, |_, _| {}).unwrap_err();
+        let error = list_folder(&missing).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 }
