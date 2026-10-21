@@ -8,4 +8,5 @@ description = "See how much space the usual desktop folders are using"
 dirs = "7"
 eframe = "0.37"
 raw-window-handle = "0.6"
+rfd = "0.15"
 windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
