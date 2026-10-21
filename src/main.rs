@@ -46,6 +46,7 @@ struct FolderApp {
     export_dialog: Option<ExportDialog>,
     anchor: Option<(usize, usize)>,
     drag_origin: Option<(usize, usize)>,
+    scroll: SmoothScroll,
 }
 
 struct FolderSection {
@@ -117,6 +118,7 @@ impl FolderApp {
             export_dialog: None,
             anchor: None,
             drag_origin: None,
+            scroll: SmoothScroll::default(),
         };
         app.spawn_scans();
         app
@@ -428,15 +430,25 @@ impl eframe::App for FolderApp {
 
         let mut anchor = self.anchor;
         let mut drag_origin = self.drag_origin;
+        let mut scroll = self.scroll;
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical()
+            scroll.advance(ui);
+            let output = egui::ScrollArea::vertical()
+                .id_salt("folder_list")
                 .auto_shrink([false, false])
+                .scroll_source(egui::containers::scroll_area::ScrollSource {
+                    scroll_bar: true,
+                    drag: egui::containers::scroll_area::DragScroll::OnTouch,
+                    mouse_wheel: false,
+                })
+                .vertical_scroll_offset(scroll.current)
                 .show(ui, |ui| {
                     for (index, section) in self.rows.iter_mut().enumerate() {
                         folder_section(ui, index, section, &mut anchor, &mut drag_origin);
                         ui.add_space(8.0);
                     }
                 });
+            scroll.follow(ui, &output);
             let dragging = ui.input(|input| {
                 input.modifiers.shift && input.pointer.button_down(egui::PointerButton::Primary)
             });
@@ -448,6 +460,7 @@ impl eframe::App for FolderApp {
         });
         self.anchor = anchor;
         self.drag_origin = drag_origin;
+        self.scroll = scroll;
 
         if open_export && self.any_child_selected() {
             self.start_selected_exports();
@@ -477,6 +490,98 @@ impl eframe::App for FolderApp {
         if let Some(indexes) = confirmed {
             self.export_dialog = None;
             self.start_exports(indexes);
+        }
+    }
+}
+
+/// Glides the folder list toward each wheel notch instead of jumping there.
+#[derive(Clone, Copy)]
+struct SmoothScroll {
+    current: f32,
+    target: f32,
+    viewport: egui::Rect,
+}
+
+impl Default for SmoothScroll {
+    fn default() -> Self {
+        Self {
+            current: 0.0,
+            target: 0.0,
+            viewport: egui::Rect::NOTHING,
+        }
+    }
+}
+
+impl SmoothScroll {
+    fn advance(&mut self, ui: &egui::Ui) {
+        let area = if self.viewport == egui::Rect::NOTHING {
+            ui.max_rect()
+        } else {
+            self.viewport
+        };
+        let pointer = ui.input(|input| input.pointer.hover_pos());
+        let over_list = pointer.is_some_and(|pos| area.contains(pos));
+        if over_list {
+            let height = area.height();
+            let wheel = ui.input(|input| {
+                if input.modifiers.shift {
+                    return 0.0;
+                }
+                let mut points = 0.0;
+                for event in &input.events {
+                    let egui::Event::MouseWheel {
+                        unit, delta, phase, ..
+                    } = event
+                    else {
+                        continue;
+                    };
+                    if matches!(phase, egui::TouchPhase::End | egui::TouchPhase::Cancel) {
+                        continue;
+                    }
+                    let distance = match unit {
+                        egui::MouseWheelUnit::Point => delta.y,
+                        egui::MouseWheelUnit::Line => delta.y * 64.0,
+                        egui::MouseWheelUnit::Page => delta.y * height,
+                    };
+                    // A trackpad already sends a stream of tiny steps.
+                    let already_smooth =
+                        matches!(unit, egui::MouseWheelUnit::Point) && delta.length() < 8.0;
+                    if already_smooth {
+                        self.current -= distance;
+                    }
+                    points += distance;
+                }
+                points
+            });
+            self.target -= wheel;
+        }
+
+        let dt = ui.input(|input| input.stable_dt).clamp(0.0, 0.1);
+        let blend = 1.0 - (-dt / 0.15).exp();
+        self.current += (self.target - self.current) * blend;
+        if (self.target - self.current).abs() < 0.4 {
+            self.current = self.target;
+        } else {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn follow(
+        &mut self,
+        ui: &egui::Ui,
+        output: &egui::containers::scroll_area::ScrollAreaOutput<()>,
+    ) {
+        let shown = output.state.clamped_offset().y;
+        if (shown - self.current).abs() > 1.0 {
+            self.current = shown;
+            self.target = shown;
+        }
+        let max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
+        self.target = self.target.clamp(0.0, max_offset);
+        self.current = self.current.clamp(0.0, max_offset);
+        self.viewport = output.inner_rect;
+        if (self.target - self.current).abs() >= 0.4 {
+            ui.ctx().request_repaint();
         }
     }
 }
