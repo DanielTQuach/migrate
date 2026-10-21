@@ -47,6 +47,7 @@ struct FolderApp {
     anchor: Option<(usize, usize)>,
     drag_origin: Option<(usize, usize)>,
     scroll: SmoothScroll,
+    show_hidden: bool,
 }
 
 struct FolderSection {
@@ -173,6 +174,7 @@ impl FolderApp {
             anchor: None,
             drag_origin: None,
             scroll: SmoothScroll::default(),
+            show_hidden: false,
         };
         app.spawn_scans();
         app
@@ -305,7 +307,7 @@ impl FolderApp {
                 let items: Vec<_> = section
                     .children
                     .iter()
-                    .filter(|child| child.selected)
+                    .filter(|child| child.selected && listed(child, self.show_hidden))
                     .cloned()
                     .collect();
                 if items.is_empty() {
@@ -383,9 +385,12 @@ impl FolderApp {
     }
 
     fn any_child_selected(&self) -> bool {
-        self.rows
-            .iter()
-            .any(|section| section.children.iter().any(|child| child.selected))
+        self.rows.iter().any(|section| {
+            section
+                .children
+                .iter()
+                .any(|child| child.selected && listed(child, self.show_hidden))
+        })
     }
 
     fn known_size(&self) -> Option<u64> {
@@ -404,7 +409,11 @@ impl FolderApp {
         let mut folders = 0;
         let mut files = 0;
         for section in &self.rows {
-            for child in &section.children {
+            for child in section
+                .children
+                .iter()
+                .filter(|child| listed(child, self.show_hidden))
+            {
                 match child.kind {
                     scan::ChildKind::Folder => folders += 1,
                     scan::ChildKind::File => files += 1,
@@ -524,6 +533,19 @@ impl eframe::App for FolderApp {
                     {
                         open_export = true;
                     }
+                    if ui
+                        .checkbox(&mut self.show_hidden, "Show hidden")
+                        .changed()
+                        && !self.show_hidden
+                    {
+                        for section in &mut self.rows {
+                            for child in &mut section.children {
+                                if child.hidden {
+                                    child.selected = false;
+                                }
+                            }
+                        }
+                    }
                 });
             });
             if let Some((copied, total)) = copy_progress {
@@ -535,6 +557,7 @@ impl eframe::App for FolderApp {
         let mut anchor = self.anchor;
         let mut drag_origin = self.drag_origin;
         let mut scroll = self.scroll;
+        let show_hidden = self.show_hidden;
         egui::CentralPanel::default().show(ui, |ui| {
             scroll.advance(ui);
             let output = egui::ScrollArea::vertical()
@@ -548,7 +571,14 @@ impl eframe::App for FolderApp {
                 .vertical_scroll_offset(scroll.current)
                 .show(ui, |ui| {
                     for (index, section) in self.rows.iter_mut().enumerate() {
-                        folder_section(ui, index, section, &mut anchor, &mut drag_origin);
+                        folder_section(
+                            ui,
+                            index,
+                            section,
+                            show_hidden,
+                            &mut anchor,
+                            &mut drag_origin,
+                        );
                         ui.add_space(8.0);
                     }
                 });
@@ -732,10 +762,15 @@ fn count_label(count: usize, one: &str, many: &str) -> String {
     format!("{} {word}", format::format_count(count as u64))
 }
 
+fn listed(child: &scan::Child, show_hidden: bool) -> bool {
+    show_hidden || !child.hidden
+}
+
 fn folder_section(
     ui: &mut egui::Ui,
     section_index: usize,
     section: &mut FolderSection,
+    show_hidden: bool,
     anchor: &mut Option<(usize, usize)>,
     drag_origin: &mut Option<(usize, usize)>,
 ) {
@@ -744,8 +779,11 @@ fn folder_section(
         .inner_margin(12.0)
         .corner_radius(8.0);
     frame.show(ui, |ui| {
-        let can_expand =
-            matches!(section.state, SectionState::Ready) && !section.children.is_empty();
+        let can_expand = matches!(section.state, SectionState::Ready)
+            && section
+                .children
+                .iter()
+                .any(|child| listed(child, show_hidden));
         if can_expand {
             let id = ui.make_persistent_id(section.name);
             let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -753,14 +791,14 @@ fn folder_section(
                 id,
                 false,
             );
-            let status = section_status(section);
+            let status = section_status(section, show_hidden);
             let name = section.name;
             let header = ui.vertical(|ui| {
                 ui.set_min_width(ui.available_width());
                 let mut name_clicked = false;
                 ui.horizontal(|ui| {
                     state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
-                    select_all_checkbox(ui, &mut section.children);
+                    select_all_checkbox(ui, &mut section.children, show_hidden);
                     let title = egui::RichText::new(name).strong().size(17.0);
                     if ui.add(egui::Button::new(title).frame(false)).clicked() {
                         name_clicked = true;
@@ -780,9 +818,13 @@ fn folder_section(
                 let shift = ui.input(|input| input.modifiers.shift);
                 let mut hits = Vec::new();
                 for (child_index, child) in section.children.iter_mut().enumerate() {
+                    if !listed(child, show_hidden) {
+                        continue;
+                    }
                     hits.push((child_index, child_row(ui, child)));
                 }
                 let rects: Vec<_> = hits.iter().map(|(_, hit)| hit.rect).collect();
+                let shown: Vec<_> = hits.iter().map(|(index, _)| *index).collect();
                 for (child_index, hit) in hits {
                     if hit.checkbox_clicked {
                         *anchor = Some((section_index, child_index));
@@ -792,9 +834,9 @@ fn folder_section(
                                 .filter(|(section, _)| *section == section_index)
                                 .map(|(_, index)| index)
                                 .unwrap_or(child_index);
-                            select_range(&mut section.children, from, child_index);
+                            select_range(&mut section.children, from, child_index, show_hidden);
                         } else {
-                            select_only(&mut section.children, child_index);
+                            select_only(&mut section.children, child_index, show_hidden);
                             *anchor = Some((section_index, child_index));
                         }
                     }
@@ -807,27 +849,29 @@ fn folder_section(
                     ui,
                     section_index,
                     &mut section.children,
+                    show_hidden,
                     drag_origin,
+                    &shown,
                     &rects,
                 );
             });
         } else {
-            section_heading(ui, section);
+            section_heading(ui, section, show_hidden);
             section_path(ui, section);
         }
     });
 }
 
-fn section_heading(ui: &mut egui::Ui, section: &FolderSection) {
+fn section_heading(ui: &mut egui::Ui, section: &FolderSection, show_hidden: bool) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(section.name).strong().size(17.0));
-        section_status_label(ui, section);
+        section_status_label(ui, section, show_hidden);
     });
 }
 
-fn section_status_label(ui: &mut egui::Ui, section: &FolderSection) {
+fn section_status_label(ui: &mut egui::Ui, section: &FolderSection, show_hidden: bool) {
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.label(egui::RichText::new(section_status(section)).monospace());
+        ui.label(egui::RichText::new(section_status(section, show_hidden)).monospace());
     });
 }
 
@@ -933,22 +977,26 @@ fn section_path(ui: &mut egui::Ui, section: &FolderSection) {
     }
 }
 
-fn section_status(section: &FolderSection) -> String {
+fn section_status(section: &FolderSection, show_hidden: bool) -> String {
+    let visible: Vec<_> = section
+        .children
+        .iter()
+        .filter(|child| listed(child, show_hidden))
+        .collect();
     match &section.state {
         SectionState::Missing => "Not available".to_string(),
         SectionState::Failed(_) => "Could not read".to_string(),
         SectionState::Waiting | SectionState::Scanning => "Reading…".to_string(),
-        SectionState::Ready if section.children.is_empty() => match section.shown_bytes() {
+        SectionState::Ready if visible.is_empty() => match section.shown_bytes() {
             Some(bytes) => format!("{}  ·  Empty", approximate_size(bytes)),
             None => "Empty".to_string(),
         },
         SectionState::Ready => {
-            let folders = section
-                .children
+            let folders = visible
                 .iter()
                 .filter(|child| child.kind == scan::ChildKind::Folder)
                 .count();
-            let files = section.children.len() - folders;
+            let files = visible.len() - folders;
             let counts = format!(
                 "{}  ·  {}",
                 count_label(folders, "folder", "folders"),
@@ -1055,33 +1103,39 @@ fn child_row(ui: &mut egui::Ui, child: &mut scan::Child) -> RowHit {
     }
 }
 
-fn select_all_checkbox(ui: &mut egui::Ui, children: &mut [scan::Child]) {
-    if children.is_empty() {
+fn select_all_checkbox(ui: &mut egui::Ui, children: &mut [scan::Child], show_hidden: bool) {
+    let visible: Vec<_> = children
+        .iter()
+        .enumerate()
+        .filter(|(_, child)| listed(child, show_hidden))
+        .map(|(index, _)| index)
+        .collect();
+    if visible.is_empty() {
         return;
     }
-    let mut all = children.iter().all(|child| child.selected);
-    let mixed = children.iter().any(|child| child.selected) && !all;
+    let mut all = visible.iter().all(|index| children[*index].selected);
+    let mixed = visible.iter().any(|index| children[*index].selected) && !all;
     if ui
         .add(egui::Checkbox::new(&mut all, "").indeterminate(mixed))
         .changed()
     {
-        for child in children {
-            child.selected = all;
+        for index in visible {
+            children[index].selected = all;
         }
     }
 }
 
-fn select_only(children: &mut [scan::Child], chosen: usize) {
+fn select_only(children: &mut [scan::Child], chosen: usize, show_hidden: bool) {
     for (index, child) in children.iter_mut().enumerate() {
-        child.selected = index == chosen;
+        child.selected = listed(child, show_hidden) && index == chosen;
     }
 }
 
-fn select_range(children: &mut [scan::Child], from: usize, to: usize) {
+fn select_range(children: &mut [scan::Child], from: usize, to: usize, show_hidden: bool) {
     let start = from.min(to);
     let end = from.max(to);
     for (index, child) in children.iter_mut().enumerate() {
-        child.selected = (start..=end).contains(&index);
+        child.selected = listed(child, show_hidden) && (start..=end).contains(&index);
     }
 }
 
@@ -1089,7 +1143,9 @@ fn apply_drag(
     ui: &mut egui::Ui,
     section_index: usize,
     children: &mut [scan::Child],
+    show_hidden: bool,
     drag_origin: &Option<(usize, usize)>,
+    shown: &[usize],
     rects: &[egui::Rect],
 ) {
     let Some((origin_section, origin_index)) = *drag_origin else {
@@ -1101,10 +1157,13 @@ fn apply_drag(
     let Some(pos) = ui.input(|input| input.pointer.interact_pos()) else {
         return;
     };
-    let Some(hover) = rects.iter().position(|rect| rect.contains(pos)) else {
+    let Some(slot) = rects.iter().position(|rect| rect.contains(pos)) else {
         return;
     };
-    select_range(children, origin_index, hover);
+    let Some(hover) = shown.get(slot).copied() else {
+        return;
+    };
+    select_range(children, origin_index, hover, show_hidden);
 }
 
 fn default_sections() -> Vec<FolderSection> {
