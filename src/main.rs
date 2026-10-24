@@ -12,7 +12,8 @@ mod scan;
 mod size;
 
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 
 use eframe::egui;
@@ -41,6 +42,7 @@ struct FolderApp {
     events: mpsc::Receiver<ScanEvent>,
     copy_events: mpsc::Receiver<CopyEvent>,
     copy_tx: mpsc::Sender<CopyEvent>,
+    copy_cancel: Arc<AtomicBool>,
     scanning: bool,
     cleared_icon: bool,
     export_dialog: Option<ExportDialog>,
@@ -66,6 +68,7 @@ enum CopyState {
     Idle,
     Copying { copied: u64, total: u64 },
     Copied(PathBuf),
+    Cancelled,
     Failed(String),
 }
 
@@ -174,6 +177,7 @@ impl FolderApp {
             events: disconnected_channel(),
             copy_events,
             copy_tx,
+            copy_cancel: Arc::new(AtomicBool::new(false)),
             scanning: false,
             cleared_icon: false,
             export_dialog: None,
@@ -264,6 +268,7 @@ impl FolderApp {
         if pending.is_empty() {
             return;
         }
+        self.copy_cancel.store(false, Ordering::Relaxed);
 
         for index in pending {
             let source = self.rows[index].path.clone().unwrap();
@@ -275,12 +280,14 @@ impl FolderApp {
             let tx = self.copy_tx.clone();
             let ctx = self.ctx.clone();
             let destination_root = destination_root.clone();
+            let cancel = Arc::clone(&self.copy_cancel);
             thread::spawn(move || {
                 let mut reporter = ProgressReporter::new(tx.clone(), ctx.clone(), index);
                 let event = match copy::copy_folder(
                     &source,
                     &destination_root,
                     name,
+                    &cancel,
                     &mut |copied, total| {
                         reporter.report(copied, total);
                     },
@@ -351,6 +358,11 @@ impl FolderApp {
         jobs: Vec<(usize, &'static str, Vec<scan::Child>)>,
         destination_root: PathBuf,
     ) {
+        if jobs.is_empty() {
+            return;
+        }
+        self.copy_cancel.store(false, Ordering::Relaxed);
+
         for (index, name, items) in jobs {
             self.rows[index].copy_state = CopyState::Copying {
                 copied: 0,
@@ -359,18 +371,24 @@ impl FolderApp {
             let tx = self.copy_tx.clone();
             let ctx = self.ctx.clone();
             let destination_root = destination_root.clone();
+            let cancel = Arc::clone(&self.copy_cancel);
             thread::spawn(move || {
                 let mut reporter = ProgressReporter::new(tx.clone(), ctx.clone(), index);
-                let event =
-                    match copy::copy_items(name, &destination_root, &items, &mut |copied, total| {
+                let event = match copy::copy_items(
+                    name,
+                    &destination_root,
+                    &items,
+                    &cancel,
+                    &mut |copied, total| {
                         reporter.report(copied, total);
-                    }) {
-                        Ok(destination) => CopyEvent::Finished { index, destination },
-                        Err(err) => CopyEvent::Failed {
-                            index,
-                            message: err.to_string(),
-                        },
-                    };
+                    },
+                ) {
+                    Ok(destination) => CopyEvent::Finished { index, destination },
+                    Err(err) => CopyEvent::Failed {
+                        index,
+                        message: err.to_string(),
+                    },
+                };
                 let _ = tx.send(event);
                 ctx.request_repaint();
             });
@@ -405,6 +423,15 @@ impl FolderApp {
             }
         }
         any.then_some((copied, total))
+    }
+
+    fn cancel_copies(&mut self) {
+        self.copy_cancel.store(true, Ordering::Relaxed);
+        for section in &mut self.rows {
+            if matches!(section.copy_state, CopyState::Copying { .. }) {
+                section.copy_state = CopyState::Cancelled;
+            }
+        }
     }
 
     fn any_child_selected(&self) -> bool {
@@ -548,13 +575,22 @@ fn apply_copy_event(rows: &mut [FolderSection], event: CopyEvent) {
             let Some(section) = rows.get_mut(index) else {
                 return;
             };
-            section.copy_state = CopyState::Copied(destination);
+            if matches!(section.copy_state, CopyState::Copying { .. }) {
+                section.copy_state = CopyState::Copied(destination);
+            }
         }
         CopyEvent::Failed { index, message } => {
             let Some(section) = rows.get_mut(index) else {
                 return;
             };
-            section.copy_state = CopyState::Failed(message);
+            if !matches!(section.copy_state, CopyState::Copying { .. }) {
+                return;
+            }
+            section.copy_state = if message == "Cancelled" {
+                CopyState::Cancelled
+            } else {
+                CopyState::Failed(message)
+            };
         }
     }
 }
@@ -576,6 +612,7 @@ impl eframe::App for FolderApp {
         let copy_progress = self.copy_progress();
         let copying = copy_progress.is_some();
         let can_export = !copying && self.rows.iter().any(|section| section.path.is_some());
+        let mut cancel_copy = false;
 
         egui::Panel::top("header").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -608,9 +645,23 @@ impl eframe::App for FolderApp {
             });
             if let Some((copied, total)) = copy_progress {
                 ui.add_space(8.0);
-                ui.add(copy_progress_bar(copied, total));
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cancel").clicked() {
+                            cancel_copy = true;
+                        }
+                        let width = ui.available_width();
+                        ui.add_sized(
+                            [width, ui.spacing().interact_size.y],
+                            copy_progress_bar(copied, total),
+                        );
+                    });
+                });
             }
         });
+        if cancel_copy {
+            self.cancel_copies();
+        }
 
         let mut anchor = self.anchor;
         let mut drag_origin = self.drag_origin;
@@ -1071,6 +1122,9 @@ fn section_path(ui: &mut egui::Ui, section: &FolderSection) {
                 )
             };
             ui.label(egui::RichText::new(label).small().weak());
+        }
+        CopyState::Cancelled => {
+            ui.label(egui::RichText::new("Cancelled").small().weak());
         }
         CopyState::Copied(path) => {
             ui.label(

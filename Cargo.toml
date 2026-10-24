@@ -9,4 +9,4 @@ dirs = "7"
 eframe = "0.37"
 raw-window-handle = "0.6"
 rfd = "0.15"
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

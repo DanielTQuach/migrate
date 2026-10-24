@@ -16,6 +16,8 @@ use std::os::windows::fs::MetadataExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -44,14 +46,25 @@ pub fn copy_folder(
     source: &Path,
     destination_root: &Path,
     name: &str,
+    cancel: &Arc<AtomicBool>,
     progress: &mut dyn FnMut(u64, u64),
 ) -> io::Result<PathBuf> {
     let destination = destination_root.join(format!("{name}_Backup"));
     ensure_outside(source, &destination, name)?;
-    let total = measure(source);
+    stopped(cancel)?;
+    let total = measure(source, cancel);
+    stopped(cancel)?;
     progress(0, total);
     let mut copied = 0;
-    robocopy(source, &destination, total, &mut copied, total, progress)?;
+    robocopy(
+        source,
+        &destination,
+        total,
+        &mut copied,
+        total,
+        cancel,
+        progress,
+    )?;
     progress(total, total);
     Ok(destination)
 }
@@ -62,6 +75,7 @@ pub fn copy_items(
     parent_name: &str,
     destination_root: &Path,
     items: &[crate::scan::Child],
+    cancel: &Arc<AtomicBool>,
     progress: &mut dyn FnMut(u64, u64),
 ) -> io::Result<PathBuf> {
     let destination = destination_root.join(format!("{parent_name}_Backup"));
@@ -71,34 +85,38 @@ pub fn copy_items(
             ensure_outside(&item.path, &target, &item.name)?;
         }
     }
+    stopped(cancel)?;
     std::fs::create_dir_all(&destination)?;
 
     let mut total: u64 = 0;
     for item in items {
         total = total.saturating_add(match item.kind {
             crate::scan::ChildKind::File => item.bytes.max(file_len(&item.path)),
-            crate::scan::ChildKind::Folder => measure(&item.path),
+            crate::scan::ChildKind::Folder => measure(&item.path, cancel),
         });
     }
+    stopped(cancel)?;
     progress(0, total);
 
     let mut copied = 0;
     for item in items {
+        stopped(cancel)?;
         let target = destination.join(&item.name);
         match item.kind {
             crate::scan::ChildKind::Folder => {
-                let folder_bytes = measure(&item.path);
+                let folder_bytes = measure(&item.path, cancel);
                 robocopy(
                     &item.path,
                     &target,
                     folder_bytes,
                     &mut copied,
                     total,
+                    cancel,
                     progress,
                 )?;
             }
             crate::scan::ChildKind::File => {
-                copy_file(&item.path, &target, &mut copied, total, progress)?;
+                copy_file(&item.path, &target, &mut copied, total, cancel, progress)?;
             }
         }
     }
@@ -116,10 +134,13 @@ fn file_len(path: &Path) -> u64 {
 ///
 /// The walk is a heap list. A backup nested dozens of folders deep must not use
 /// one stack frame per folder — that is the panic "has overflowed its stack".
-fn measure(path: &Path) -> u64 {
+fn measure(path: &Path, cancel: &Arc<AtomicBool>) -> u64 {
     let mut total: u64 = 0;
     let mut pending = vec![path.to_path_buf()];
     while let Some(path) = pending.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            return total;
+        }
         let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
         };
@@ -145,6 +166,7 @@ fn copy_file(
     destination: &Path,
     copied: &mut u64,
     total: u64,
+    cancel: &Arc<AtomicBool>,
     progress: &mut dyn FnMut(u64, u64),
 ) -> io::Result<()> {
     if let Some(parent) = destination.parent() {
@@ -154,6 +176,7 @@ fn copy_file(
     let mut to = File::create(destination)?;
     let mut buf = vec![0_u8; 1024 * 1024];
     loop {
+        stopped(cancel)?;
         let n = from.read(&mut buf)?;
         if n == 0 {
             break;
@@ -171,6 +194,7 @@ fn robocopy(
     folder_bytes: u64,
     copied: &mut u64,
     total: u64,
+    cancel: &Arc<AtomicBool>,
     progress: &mut dyn FnMut(u64, u64),
 ) -> io::Result<()> {
     let folder_name = source
@@ -190,6 +214,22 @@ fn robocopy(
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
+
+    let stop_watch = Arc::new(AtomicBool::new(false));
+    let watch = {
+        let cancel = Arc::clone(cancel);
+        let stop_watch = Arc::clone(&stop_watch);
+        let pid = child.id();
+        thread::spawn(move || {
+            while !stop_watch.load(Ordering::Relaxed) {
+                if cancel.load(Ordering::Relaxed) {
+                    stop_process(pid);
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(40));
+            }
+        })
+    };
 
     let stderr = child.stderr.take();
     let stderr_task = thread::spawn(move || {
@@ -224,7 +264,10 @@ fn robocopy(
     }
 
     let status = child.wait()?;
+    stop_watch.store(true, Ordering::Relaxed);
+    let _ = watch.join();
     let stderr = stderr_task.join().unwrap_or_default();
+    stopped(cancel)?;
     let code = status.code().unwrap_or(16);
     if (0..8).contains(&code) {
         *copied = started.saturating_add(folder_bytes);
@@ -331,6 +374,28 @@ fn command_detail(stderr: &[u8], stdout: &[u8]) -> String {
 /// Paths are compared by their real location, so `Desktop` and `desktop`, or a
 /// `\\?\` path from the folder picker, still match. A sibling such as
 /// `Desktop_Backup` does not.
+fn stopped(cancel: &Arc<AtomicBool>) -> io::Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled"))
+    } else {
+        Ok(())
+    }
+}
+
+fn stop_process(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle.is_null() {
+            return;
+        }
+        TerminateProcess(handle, 1);
+        CloseHandle(handle);
+    }
+}
+
 fn ensure_outside(source: &Path, destination: &Path, name: &str) -> io::Result<()> {
     if destination_is_inside(source, destination) {
         Err(nest_error(name))
@@ -438,6 +503,10 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn stay() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
     #[test]
     fn counts_a_partial_file_then_the_next_one() {
         let mut meter = RoboMeter::default();
@@ -468,6 +537,7 @@ mod tests {
             &source,
             &destination_root,
             "Downloads",
+            &stay(),
             &mut |copied, total| {
                 last = (copied, total);
             },
@@ -495,7 +565,7 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("a.txt"), b"hello").unwrap();
 
-        let error = copy_folder(&source, &source, "Desktop", &mut |_, _| {}).unwrap_err();
+        let error = copy_folder(&source, &source, "Desktop", &stay(), &mut |_, _| {}).unwrap_err();
         assert!(error.to_string().contains("outside Desktop"), "{}", error);
         assert!(!source.join("Desktop_Backup").exists());
 
@@ -521,7 +591,7 @@ mod tests {
             hidden: false,
         };
 
-        let error = copy_items("Desktop", &projects, &[item], &mut |_, _| {}).unwrap_err();
+        let error = copy_items("Desktop", &projects, &[item], &stay(), &mut |_, _| {}).unwrap_err();
         assert!(error.to_string().contains("outside Projects"), "{}", error);
         assert!(!projects.join("Desktop_Backup").exists());
 
@@ -541,7 +611,7 @@ mod tests {
         }
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("a.txt"), b"hi").unwrap();
-        assert_eq!(measure(&root), 2);
+        assert_eq!(measure(&root, &stay()), 2);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -577,8 +647,14 @@ mod tests {
         fs::create_dir_all(&destination_root).unwrap();
         fs::write(source.join("a.txt"), b"hello").unwrap();
 
-        let error =
-            copy_folder(&source, &destination_root, "Downloads", &mut |_, _| {}).unwrap_err();
+        let error = copy_folder(
+            &source,
+            &destination_root,
+            "Downloads",
+            &stay(),
+            &mut |_, _| {},
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("outside Downloads"), "{}", error);
         assert!(!destination_root.join("Downloads_Backup").exists());
 
