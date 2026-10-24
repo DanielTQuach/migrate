@@ -129,9 +129,15 @@ impl ProgressReporter {
 }
 
 struct ExportDialog {
-    choosing: bool,
-    selected: Vec<bool>,
     open: bool,
+    destination: PathBuf,
+    /// `true` when the list is selected files and folders, not the whole-folder list.
+    item_export: bool,
+    /// One entry per main folder. `true` means it is still in the export.
+    folders: Vec<bool>,
+    /// Selected files and folders, with any that would nest already removed.
+    items: Vec<(usize, &'static str, Vec<scan::Child>)>,
+    removed: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -244,24 +250,20 @@ impl FolderApp {
             .any(|section| matches!(section.state, SectionState::Scanning));
     }
 
-    fn start_exports(&mut self, indexes: Vec<usize>) {
+    fn start_exports(&mut self, indexes: Vec<usize>, destination_root: PathBuf) {
         let pending: Vec<_> = indexes
             .into_iter()
             .filter(|index| {
                 self.rows[*index].path.is_some()
                     && !matches!(self.rows[*index].copy_state, CopyState::Copying { .. })
+                    && !self.rows[*index].path.as_ref().is_some_and(|path| {
+                        copy::backup_would_nest(path, &destination_root, self.rows[*index].name)
+                    })
             })
             .collect();
         if pending.is_empty() {
             return;
         }
-
-        let Some(destination_root) = rfd::FileDialog::new()
-            .set_title("Copy folders to")
-            .pick_folder()
-        else {
-            return;
-        };
 
         for index in pending {
             let source = self.rows[index].path.clone().unwrap();
@@ -328,6 +330,27 @@ impl FolderApp {
             return;
         };
 
+        let (jobs, removed) = without_nesting_items(jobs, &destination_root);
+        if !removed.is_empty() {
+            self.export_dialog = Some(ExportDialog {
+                open: true,
+                destination: destination_root,
+                item_export: true,
+                folders: Vec::new(),
+                items: jobs,
+                removed,
+            });
+            return;
+        }
+
+        self.launch_item_exports(jobs, destination_root);
+    }
+
+    fn launch_item_exports(
+        &mut self,
+        jobs: Vec<(usize, &'static str, Vec<scan::Child>)>,
+        destination_root: PathBuf,
+    ) {
         for (index, name, items) in jobs {
             self.rows[index].copy_state = CopyState::Copying {
                 copied: 0,
@@ -421,6 +444,43 @@ impl FolderApp {
             }
         }
         (folders, files)
+    }
+
+    /// Destination first, then the folder list with anything that would nest removed.
+    fn open_folder_export(&mut self) {
+        let Some(destination) = rfd::FileDialog::new()
+            .set_title("Copy folders to")
+            .pick_folder()
+        else {
+            return;
+        };
+
+        let mut removed = Vec::new();
+        let folders = self
+            .rows
+            .iter()
+            .map(|section| {
+                let Some(path) = section.path.as_ref() else {
+                    return false;
+                };
+                if copy::backup_would_nest(path, &destination, section.name) {
+                    removed.push(section.name.to_string());
+                    false
+                } else if matches!(section.copy_state, CopyState::Copying { .. }) {
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        self.export_dialog = Some(ExportDialog {
+            open: true,
+            destination,
+            item_export: false,
+            folders,
+            items: Vec::new(),
+            removed,
+        });
     }
 }
 
@@ -533,9 +593,7 @@ impl eframe::App for FolderApp {
                     {
                         open_export = true;
                     }
-                    if ui
-                        .checkbox(&mut self.show_hidden, "Show hidden")
-                        .changed()
+                    if ui.checkbox(&mut self.show_hidden, "Show hidden").changed()
                         && !self.show_hidden
                     {
                         for section in &mut self.rows {
@@ -599,31 +657,38 @@ impl eframe::App for FolderApp {
         if open_export && self.any_child_selected() {
             self.start_selected_exports();
         } else if open_export {
-            self.export_dialog = Some(ExportDialog {
-                choosing: false,
-                selected: self
-                    .rows
-                    .iter()
-                    .map(|section| section.path.is_some())
-                    .collect(),
-                open: true,
-            });
+            self.open_folder_export();
         }
 
-        let mut confirmed = None;
+        let mut copy_folders = None;
+        let mut copy_items = None;
         if let Some(dialog) = self.export_dialog.as_mut() {
-            confirmed = export_dialog(ui.ctx(), dialog, &self.rows);
+            let action = export_dialog(ui.ctx(), dialog, &self.rows);
             if !dialog.open {
                 self.export_dialog = None;
+            } else if let Some(action) = action {
+                match action {
+                    ExportAction::CopyFolders(indexes) => {
+                        copy_folders = Some((indexes, dialog.destination.clone()));
+                    }
+                    ExportAction::CopyItems => {
+                        copy_items = Some((dialog.items.clone(), dialog.destination.clone()));
+                    }
+                }
             }
         }
 
         if rescan {
             self.spawn_scans();
         }
-        if let Some(indexes) = confirmed {
+        if copy_folders.is_some() || copy_items.is_some() {
             self.export_dialog = None;
-            self.start_exports(indexes);
+        }
+        if let Some((indexes, destination)) = copy_folders {
+            self.start_exports(indexes, destination);
+        }
+        if let Some((jobs, destination)) = copy_items {
+            self.launch_item_exports(jobs, destination);
         }
     }
 }
@@ -875,70 +940,117 @@ fn section_status_label(ui: &mut egui::Ui, section: &FolderSection, show_hidden:
     });
 }
 
+enum ExportAction {
+    CopyFolders(Vec<usize>),
+    CopyItems,
+}
+
 fn export_dialog(
     ctx: &egui::Context,
     dialog: &mut ExportDialog,
     rows: &[FolderSection],
-) -> Option<Vec<usize>> {
-    let mut confirmed = None;
+) -> Option<ExportAction> {
+    let mut action = None;
     let response = egui::Window::new("Export")
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .open(&mut dialog.open)
         .show(ctx, |ui| {
-            ui.label("Copy every folder, or choose which ones.");
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("All folders").clicked() {
-                    confirmed = Some(available_indexes(rows));
-                }
-                if ui.button("Choose folders").clicked() {
-                    dialog.choosing = true;
-                }
-            });
-            if dialog.choosing {
+            ui.label(format!("Copy to {}", dialog.destination.display()));
+            if !dialog.removed.is_empty() {
                 ui.add_space(8.0);
+                ui.label(removed_note(&dialog.removed));
+            }
+            ui.add_space(8.0);
+            if !dialog.item_export {
                 for (index, section) in rows.iter().enumerate() {
+                    if dialog.removed.iter().any(|name| name == section.name) {
+                        continue;
+                    }
+                    if section.path.is_none() {
+                        continue;
+                    }
+                    let copying = matches!(section.copy_state, CopyState::Copying { .. });
                     ui.add_enabled(
-                        section.path.is_some(),
-                        egui::Checkbox::new(&mut dialog.selected[index], section.name),
+                        !copying,
+                        egui::Checkbox::new(&mut dialog.folders[index], section.name),
                     );
                 }
                 ui.add_space(8.0);
-                let any_selected = dialog
-                    .selected
+                let keep: Vec<_> = dialog
+                    .folders
                     .iter()
                     .enumerate()
-                    .any(|(index, selected)| *selected && rows[index].path.is_some());
+                    .filter(|(index, selected)| **selected && rows[*index].path.is_some())
+                    .map(|(index, _)| index)
+                    .collect();
                 if ui
-                    .add_enabled(any_selected, egui::Button::new("Continue"))
+                    .add_enabled(!keep.is_empty(), egui::Button::new("Copy"))
                     .clicked()
                 {
-                    confirmed = Some(
-                        dialog
-                            .selected
-                            .iter()
-                            .enumerate()
-                            .filter(|(index, selected)| **selected && rows[*index].path.is_some())
-                            .map(|(index, _)| index)
-                            .collect(),
-                    );
+                    action = Some(ExportAction::CopyFolders(keep));
+                }
+            } else {
+                for (_, parent, items) in &dialog.items {
+                    ui.label(egui::RichText::new(*parent).strong());
+                    for item in items {
+                        ui.label(format!("  {}", item.name));
+                    }
+                }
+                ui.add_space(8.0);
+                if ui
+                    .add_enabled(!dialog.items.is_empty(), egui::Button::new("Copy"))
+                    .clicked()
+                {
+                    action = Some(ExportAction::CopyItems);
                 }
             }
         });
     if response.is_none() {
         dialog.open = false;
     }
-    confirmed
+    action
 }
 
-fn available_indexes(rows: &[FolderSection]) -> Vec<usize> {
-    rows.iter()
-        .enumerate()
-        .filter(|(_, section)| section.path.is_some())
-        .map(|(index, _)| index)
-        .collect()
+fn removed_note(names: &[String]) -> String {
+    let list = match names {
+        [one] => one.clone(),
+        [first, second] => format!("{first} and {second}"),
+        many => {
+            let (last, rest) = many.split_last().unwrap();
+            format!("{} and {last}", rest.join(", "))
+        }
+    };
+    let verb = if names.len() == 1 { "was" } else { "were" };
+    let those = if names.len() == 1 {
+        "that folder"
+    } else {
+        "those folders"
+    };
+    format!("{list} {verb} removed from this export. The destination is inside {those}.")
+}
+
+fn without_nesting_items(
+    mut jobs: Vec<(usize, &'static str, Vec<scan::Child>)>,
+    destination: &std::path::Path,
+) -> (Vec<(usize, &'static str, Vec<scan::Child>)>, Vec<String>) {
+    let mut removed = Vec::new();
+    for (_, parent, items) in &mut jobs {
+        let mut kept = Vec::new();
+        for item in items.drain(..) {
+            let nests = item.kind == scan::ChildKind::Folder
+                && copy::item_would_nest(&item.path, destination, parent, &item.name);
+            if nests {
+                removed.push(format!("{parent}\\{}", item.name));
+            } else {
+                kept.push(item);
+            }
+        }
+        *items = kept;
+    }
+    jobs.retain(|(_, _, items)| !items.is_empty());
+    (jobs, removed)
 }
 
 fn section_path(ui: &mut egui::Ui, section: &FolderSection) {

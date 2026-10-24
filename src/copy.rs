@@ -4,18 +4,41 @@
 //! the source, including nested folders. Junctions are skipped so a link such as
 //! `Documents\My Music` is not followed into Music.
 //!
+//! A destination inside the source is refused. robocopy would otherwise copy the
+//! new backup folder into itself and nest copies without stopping — for example
+//! choosing Desktop while copying Desktop.
+//!
 //! `progress` is called with `(bytes_copied, bytes_total)` while the copy runs.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+/// The backup folder `{destination_root}\{name}_Backup` would sit inside `source`.
+pub fn backup_would_nest(source: &Path, destination_root: &Path, name: &str) -> bool {
+    let destination = destination_root.join(format!("{name}_Backup"));
+    destination_is_inside(source, &destination)
+}
+
+/// Copying this folder would put the backup inside the folder itself.
+pub fn item_would_nest(
+    source: &Path,
+    destination_root: &Path,
+    parent_name: &str,
+    item_name: &str,
+) -> bool {
+    let target = destination_root
+        .join(format!("{parent_name}_Backup"))
+        .join(item_name);
+    destination_is_inside(source, &target)
+}
 
 pub fn copy_folder(
     source: &Path,
@@ -24,6 +47,7 @@ pub fn copy_folder(
     progress: &mut dyn FnMut(u64, u64),
 ) -> io::Result<PathBuf> {
     let destination = destination_root.join(format!("{name}_Backup"));
+    ensure_outside(source, &destination, name)?;
     let total = measure(source);
     progress(0, total);
     let mut copied = 0;
@@ -41,6 +65,12 @@ pub fn copy_items(
     progress: &mut dyn FnMut(u64, u64),
 ) -> io::Result<PathBuf> {
     let destination = destination_root.join(format!("{parent_name}_Backup"));
+    for item in items {
+        if item.kind == crate::scan::ChildKind::Folder {
+            let target = destination.join(&item.name);
+            ensure_outside(&item.path, &target, &item.name)?;
+        }
+    }
     std::fs::create_dir_all(&destination)?;
 
     let mut total: u64 = 0;
@@ -83,29 +113,31 @@ fn file_len(path: &Path) -> u64 {
 }
 
 /// Bytes in this tree. Junctions and other links are skipped, matching robocopy `/XJ`.
+///
+/// The walk is a heap list. A backup nested dozens of folders deep must not use
+/// one stack frame per folder — that is the panic "has overflowed its stack".
 fn measure(path: &Path) -> u64 {
     let mut total: u64 = 0;
-    measure_at(path, &mut total);
-    total
-}
-
-fn measure_at(path: &Path, total: &mut u64) {
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return;
-    }
-    if meta.is_dir() {
-        let Ok(entries) = fs::read_dir(path) else {
-            return;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
         };
-        for entry in entries.flatten() {
-            measure_at(&entry.path(), total);
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            continue;
         }
-    } else {
-        *total = total.saturating_add(meta.len());
+        if meta.is_dir() {
+            let Ok(entries) = fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                pending.push(entry.path());
+            }
+        } else {
+            total = total.saturating_add(meta.len());
+        }
     }
+    total
 }
 
 fn copy_file(
@@ -141,10 +173,19 @@ fn robocopy(
     total: u64,
     progress: &mut dyn FnMut(u64, u64),
 ) -> io::Result<()> {
+    let folder_name = source
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "this folder".to_string());
+    ensure_outside(source, destination, &folder_name)?;
+
+    // `/XD` keeps robocopy from walking into the folder it is writing. That
+    // stops a destination inside the source from nesting copies forever.
     let mut child = Command::new("robocopy")
         .arg(source)
         .arg(destination)
-        .args(["/E", "/XJ", "/R:2", "/W:2", "/BYTES"])
+        .args(["/E", "/XJ", "/R:2", "/W:2", "/BYTES", "/XD"])
+        .arg(destination)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW)
@@ -192,6 +233,11 @@ fn robocopy(
     }
 
     let detail = command_detail(&stderr, &tail);
+    if runaway_copy(&detail) {
+        return Err(io::Error::other(format!(
+            "{folder_name} has folders nested too deeply for Windows to copy. Remove the nested backup inside it, then try again."
+        )));
+    }
     let message = if detail.is_empty() {
         format!("robocopy stopped with code {code}")
     } else {
@@ -280,6 +326,99 @@ fn command_detail(stderr: &[u8], stdout: &[u8]) -> String {
     tail(String::from_utf8_lossy(stdout).trim())
 }
 
+/// Refuse when `destination` is `source`, or a folder inside it.
+///
+/// Paths are compared by their real location, so `Desktop` and `desktop`, or a
+/// `\\?\` path from the folder picker, still match. A sibling such as
+/// `Desktop_Backup` does not.
+fn ensure_outside(source: &Path, destination: &Path, name: &str) -> io::Result<()> {
+    if destination_is_inside(source, destination) {
+        Err(nest_error(name))
+    } else {
+        Ok(())
+    }
+}
+
+fn nest_error(name: &str) -> io::Error {
+    io::Error::other(format!(
+        "Choose a destination outside {name}. A folder inside {name} would be copied into itself over and over."
+    ))
+}
+
+/// Windows says this when a copy nests folders until the path is too deep.
+fn runaway_copy(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("overflowed its stack")
+        || lower.contains("stack overflowed")
+        || lower.contains("recursion too deep")
+        || lower.contains("filename or extension is too long")
+}
+
+fn destination_is_inside(source: &Path, destination: &Path) -> bool {
+    let source = normalize_path(source);
+    let destination = normalize_path(destination);
+    destination.starts_with(&source)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let resolved = resolve_existing_prefix(path);
+    lowercase_path(&lexical_normalize(&strip_verbatim(&resolved)))
+}
+
+/// Canonicalize the longest prefix that already exists, then put the rest back.
+/// The backup folder usually does not exist yet, but its parent does.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    let mut pending = Vec::new();
+    loop {
+        if let Ok(canon) = fs::canonicalize(&current) {
+            let mut resolved = canon;
+            for part in pending.iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        let Some(name) = current.file_name().map(|name| name.to_os_string()) else {
+            return path.to_path_buf();
+        };
+        if !current.pop() {
+            return path.to_path_buf();
+        }
+        pending.push(name);
+    }
+}
+
+fn strip_verbatim(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if out.file_name().is_some() {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn lowercase_path(path: &Path) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().to_lowercase())
+}
+
 fn tail(text: &str) -> String {
     const LIMIT: usize = 400;
     if text.chars().count() <= LIMIT {
@@ -343,5 +482,121 @@ mod tests {
         );
         assert_eq!(last, (11, 11));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refuses_a_destination_inside_the_source() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("migrate-nest-{stamp}"));
+        let source = root.join("Desktop");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), b"hello").unwrap();
+
+        let error = copy_folder(&source, &source, "Desktop", &mut |_, _| {}).unwrap_err();
+        assert!(error.to_string().contains("outside Desktop"), "{}", error);
+        assert!(!source.join("Desktop_Backup").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refuses_a_selected_folder_that_contains_the_destination() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("migrate-nest-item-{stamp}"));
+        let projects = root.join("Projects");
+        fs::create_dir_all(&projects).unwrap();
+        fs::write(projects.join("a.txt"), b"hello").unwrap();
+        let item = crate::scan::Child {
+            name: "Projects".to_string(),
+            path: projects.clone(),
+            kind: crate::scan::ChildKind::Folder,
+            bytes: 0,
+            selected: true,
+            hidden: false,
+        };
+
+        let error = copy_items("Desktop", &projects, &[item], &mut |_, _| {}).unwrap_err();
+        assert!(error.to_string().contains("outside Projects"), "{}", error);
+        assert!(!projects.join("Desktop_Backup").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn measures_a_deep_tree_without_recursing_on_the_stack() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("migrate-deep-{stamp}"));
+        let mut path = root.clone();
+        for index in 0..80 {
+            path.push(format!("level{index}"));
+        }
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("a.txt"), b"hi").unwrap();
+        assert_eq!(measure(&root), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_destination_inside_downloads_is_left_out_of_the_export() {
+        let source = Path::new(r"C:\Users\me\Downloads");
+        let inside = source.join("BACKUP");
+        assert!(backup_would_nest(source, &inside, "Downloads"));
+        assert!(!backup_would_nest(
+            source,
+            Path::new(r"D:\Drive"),
+            "Downloads"
+        ));
+        assert!(item_would_nest(&inside, &inside, "Downloads", "BACKUP"));
+    }
+
+    #[test]
+    fn a_sibling_whose_name_starts_like_the_source_is_outside_it() {
+        let source = Path::new(r"C:\Users\me\Desktop");
+        let sibling = Path::new(r"C:\Users\me\Desktop_Backup");
+        assert!(!destination_is_inside(source, sibling));
+    }
+
+    #[test]
+    fn a_backup_directory_inside_the_source_is_rejected() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("migrate-backup-dir-{stamp}"));
+        let source = root.join("Downloads");
+        let destination_root = source.join("BACKUP");
+        fs::create_dir_all(&destination_root).unwrap();
+        fs::write(source.join("a.txt"), b"hello").unwrap();
+
+        let error =
+            copy_folder(&source, &destination_root, "Downloads", &mut |_, _| {}).unwrap_err();
+        assert!(error.to_string().contains("outside Downloads"), "{}", error);
+        assert!(!destination_root.join("Downloads_Backup").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_windows_nesting_failure_uses_the_plain_message() {
+        assert!(runaway_copy(
+            "ERROR 1001 (0x000003E9) Creating Destination Directory C:\\Users\\me\\Downloads\\BACKUP\\Downloads_Backup The recursion too deep; the stack overflowed."
+        ));
+        assert!(!runaway_copy("access is denied"));
+    }
+
+    #[test]
+    fn nesting_matches_case_and_a_verbatim_prefix() {
+        let source = Path::new(r"\\?\C:\Users\me\Desktop");
+        let destination = Path::new(r"c:\users\me\desktop\Desktop_Backup");
+        assert!(destination_is_inside(source, destination));
     }
 }
